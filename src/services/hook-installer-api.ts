@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { HookInstallStatus, InstallClaudeHooksResult, ListenerStatus } from "@/types/hooks";
+import type { HookInstallStatus, HookTip, InstallClaudeHooksResult, ListenerStatus } from "@/types/hooks";
 
 const tauriAvailable = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
@@ -20,6 +20,8 @@ let mockStatus: HookInstallStatus = {
   paths: { ...defaultPaths },
 };
 
+let mockTips: HookTip[] = [];
+
 export async function getHookInstallStatus(): Promise<HookInstallStatus> {
   if (tauriAvailable) {
     return invoke<HookInstallStatus>("get_hook_install_status");
@@ -32,7 +34,7 @@ export async function installClaudeHooks(overwriteHooks: boolean): Promise<Insta
     return invoke<InstallClaudeHooksResult>("install_claude_hooks", { overwriteHooks });
   }
 
-  const hadHooks = mockStatus.hooksExists;
+  const hadSettings = mockStatus.settingsExists;
   if (mockStatus.hooksExists && !overwriteHooks) {
     throw new Error("检测到 settings.json 已存在 hooks，请确认覆盖后重试");
   }
@@ -47,7 +49,7 @@ export async function installClaudeHooks(overwriteHooks: boolean): Promise<Insta
 
   return {
     ok: true,
-    backupPath: hadHooks ? "~/.claude/settings.json.bak.mock" : null,
+    backupPath: hadSettings ? "~/.claude/settings.json.bak.mock" : null,
     settingsPath: mockStatus.paths.settingsPath,
     scriptDir: mockStatus.paths.scriptDir,
     overwrittenHooks: overwriteHooks,
@@ -77,4 +79,29 @@ export async function getListenerStatus(): Promise<ListenerStatus> {
     return invoke<ListenerStatus>("get_listener_status");
   }
   return { running: mockStatus.listenerRunning, pid: mockStatus.listenerRunning ? 9527 : null, port: 17373 };
+}
+
+export async function getRecentHookTips(limit = 5): Promise<HookTip[]> {
+  if (tauriAvailable) {
+    return invoke<HookTip[]>("get_recent_hook_tips", { limit });
+  }
+
+  if (mockStatus.listenerRunning && mockStatus.hooksExists && mockTips.length === 0) {
+    mockTips = [
+      {
+        time: new Date().toISOString(),
+        event: "UserPromptSubmit",
+        detail: "用户提交了新请求",
+      },
+    ];
+  }
+
+  return mockTips.slice(Math.max(0, mockTips.length - limit));
+}
+
+export async function openHookLogFolder(): Promise<string> {
+  if (tauriAvailable) {
+    return invoke<string>("open_hook_log_folder");
+  }
+  return "~/.claude/claude-notify-bot";
 }

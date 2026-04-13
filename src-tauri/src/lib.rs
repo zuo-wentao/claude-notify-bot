@@ -8,6 +8,7 @@ use std::{
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use tauri::Manager;
 
 const LISTENER_PORT: u16 = 17373;
 
@@ -106,6 +107,14 @@ struct ListenerStatus {
     running: bool,
     pid: Option<u32>,
     port: u16,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HookTip {
+    time: String,
+    event: String,
+    detail: String,
 }
 
 fn mock_devices() -> Vec<DeviceSummary> {
@@ -346,7 +355,7 @@ function writeLogLine(rawPayload) {
   };
 
   try {
-    fs.appendFileSync(logPath, JSON.stringify(line) + "\\n", "utf8");
+    fs.appendFileSync(logPath, JSON.stringify(line) + "\n", "utf8");
   } catch (err) {
     console.error(`[hook-forwarder] 写日志失败: ${err.message}`);
   }
@@ -555,17 +564,6 @@ fn hook_template_value(paths: &HookPathsBuf) -> Value {
             }
           ]
         }
-      ],
-      "PermissionDenied": [
-        {
-          "hooks": [
-            {
-              "type": "command",
-              "command": forwarder_cmd,
-              "timeout": 2
-            }
-          ]
-        }
       ]
     })
 }
@@ -589,6 +587,36 @@ fn external_script_warnings() -> Vec<String> {
     }
 
     warnings
+}
+
+fn parse_hook_tip(line: &str) -> Option<HookTip> {
+    let value = serde_json::from_str::<Value>(line).ok()?;
+    let time = value.get("time").and_then(Value::as_str)?.to_string();
+    let event = value
+        .get("hook_event_name")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let notification_type = value
+        .get("notification_type")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+
+    let detail = match event.as_str() {
+        "PermissionRequest" => "等待权限确认".to_string(),
+        "UserPromptSubmit" => "用户提交了新请求".to_string(),
+        "Stop" => "任务结束".to_string(),
+        "Notification" if !notification_type.is_empty() => {
+            format!("通知类型: {notification_type}")
+        }
+        _ => "Hook 触发".to_string(),
+    };
+
+    Some(HookTip {
+        time,
+        event,
+        detail,
+    })
 }
 
 fn listener_status_internal(state: &AppState) -> Result<ListenerStatus, String> {
@@ -845,7 +873,7 @@ fn install_claude_hooks(
         fs::create_dir_all(parent).map_err(|error| format!("创建 .claude 目录失败: {error}"))?;
     }
 
-    let backup_path = if hooks_exists {
+    let backup_path = if settings_exists {
         let backup = paths
             .settings_path
             .with_file_name(format!("settings.json.bak.{}", current_unix_timestamp()));
@@ -901,6 +929,68 @@ fn get_listener_status(state: tauri::State<'_, AppState>) -> Result<ListenerStat
     listener_status_internal(state.inner())
 }
 
+#[tauri::command]
+fn get_recent_hook_tips(limit: Option<usize>) -> Result<Vec<HookTip>, String> {
+    let take_count = limit.unwrap_or(5).clamp(1, 50);
+    let log_path = hook_paths_buf().log_path;
+
+    if !log_path.exists() {
+        return Ok(vec![]);
+    }
+
+    let raw = fs::read_to_string(&log_path).map_err(|error| format!("读取 hook 日志失败: {error}"))?;
+    let normalized = raw
+        .replace("}\\n{", "}\n{")
+        .replace("}\\n", "}\n");
+
+    let tips = normalized
+        .lines()
+        .rev()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(parse_hook_tip)
+        .take(take_count)
+        .collect::<Vec<_>>();
+
+    Ok(tips)
+}
+
+#[tauri::command]
+fn open_hook_log_folder() -> Result<String, String> {
+    let script_dir = hook_paths_buf().script_dir;
+    if !script_dir.exists() {
+        return Err(format!(
+            "日志目录不存在，请先安装 hooks: {}",
+            path_to_string(&script_dir)
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg(&script_dir)
+            .spawn()
+            .map_err(|error| format!("打开日志目录失败: {error}"))?;
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("explorer")
+            .arg(&script_dir)
+            .spawn()
+            .map_err(|error| format!("打开日志目录失败: {error}"))?;
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        Command::new("xdg-open")
+            .arg(&script_dir)
+            .spawn()
+            .map_err(|error| format!("打开日志目录失败: {error}"))?;
+    }
+
+    Ok(path_to_string(&script_dir))
+}
+
 pub fn run() {
     tauri::Builder::default()
         .manage(AppState::default())
@@ -920,7 +1010,9 @@ pub fn run() {
             install_claude_hooks,
             start_listener,
             stop_listener,
-            get_listener_status
+            get_listener_status,
+            get_recent_hook_tips,
+            open_hook_log_folder
         ])
         .run(tauri::generate_context!())
         .expect("failed to run app");

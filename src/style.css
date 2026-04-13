@@ -59,6 +59,10 @@ body {
   }
 }
 
+[data-sidebar="menu-button"] > svg {
+  display: block;
+}
+
 
 
 @layer base {

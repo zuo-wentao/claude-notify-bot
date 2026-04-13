@@ -30,3 +30,9 @@ export interface ListenerStatus {
   pid?: number | null;
   port: number;
 }
+
+export interface HookTip {
+  time: string;
+  event: string;
+  detail: string;
+}
