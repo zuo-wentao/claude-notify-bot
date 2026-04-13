@@ -4,6 +4,7 @@ import { House, Workflow, CircleHelp, ExternalLink } from "lucide-vue-next";
 import Card from "@/components/ui/Card.vue";
 import Badge from "@/components/ui/Badge.vue";
 import UiSwitch from "@/components/ui/Switch.vue";
+import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import {
   Sidebar,
@@ -24,6 +25,14 @@ import {
 } from "@/components/ui/sidebar";
 import { useBluetoothStore } from "@/stores/bluetooth";
 import heroDeviceIcon from "@/assets/hero-device-placeholder.svg";
+import {
+  getHookInstallStatus,
+  getListenerStatus,
+  installClaudeHooks,
+  startListener,
+  stopListener,
+} from "@/services/hook-installer-api";
+import type { HookInstallStatus } from "@/types/hooks";
 
 type PageKey = "home" | "mapping" | "about";
 
@@ -50,9 +59,12 @@ const mappingRows = [
   { event: "DONE", action: "设备绿灯常亮 2 秒", note: "任务完成提示" },
 ];
 
-onMounted(async () => {
-  await store.initialize();
-});
+const hookStatus = ref<HookInstallStatus | null>(null);
+const hookLoading = ref(false);
+const listenerLoading = ref(false);
+const hookMessage = ref("");
+const hookError = ref("");
+const hookWarnings = ref<string[]>([]);
 
 const stateUi = computed(() => {
   switch (store.connectionState) {
@@ -72,15 +84,15 @@ const stateUi = computed(() => {
 const heroIconClass = computed(() => {
   switch (store.connectionState) {
     case "connected":
-      return "opacity-100 grayscale-0 drop-shadow-[0_0_72px_rgba(249,115,22,0.82)]";
+      return "opacity-100 grayscale-0 drop-shadow-[0_0_96px_rgba(249,115,22,0.9)]";
     case "connecting":
-      return "opacity-95 grayscale-0 animate-pulse drop-shadow-[0_0_96px_rgba(251,146,60,0.9)]";
+      return "opacity-95 grayscale-0 animate-pulse drop-shadow-[0_0_110px_rgba(251,146,60,0.95)]";
     case "scanning":
-      return "opacity-95 grayscale-0 animate-pulse drop-shadow-[0_0_68px_rgba(251,146,60,0.72)]";
+      return "opacity-95 grayscale-0 animate-pulse drop-shadow-[0_0_100px_rgba(251,146,60,0.78)]";
     case "error":
-      return "opacity-75 grayscale drop-shadow-[0_0_56px_rgba(244,63,94,0.58)]";
+      return "opacity-75 grayscale drop-shadow-[0_0_64px_rgba(244,63,94,0.62)]";
     default:
-      return "opacity-60 grayscale drop-shadow-[0_0_26px_rgba(212,212,216,0.28)]";
+      return "opacity-60 grayscale drop-shadow-[0_0_42px_rgba(212,212,216,0.4)]";
   }
 });
 
@@ -98,6 +110,115 @@ const heroStatusHint = computed(() => {
       return "尚未连接设备";
   }
 });
+
+const hookInstalled = computed(() => {
+  if (!hookStatus.value) return false;
+  return hookStatus.value.hooksExists && hookStatus.value.scriptFilesReady;
+});
+
+const listenerRunning = computed(() => hookStatus.value?.listenerRunning ?? false);
+const settingsPathText = computed(() => hookStatus.value?.paths.settingsPath ?? "~/.claude/settings.json");
+const scriptDirText = computed(() => hookStatus.value?.paths.scriptDir ?? "~/.claude/claude-notify-bot");
+
+function resetHookFeedback() {
+  hookError.value = "";
+  hookMessage.value = "";
+  hookWarnings.value = [];
+}
+
+async function refreshHookStatus() {
+  try {
+    const status = await getHookInstallStatus();
+    try {
+      const listener = await getListenerStatus();
+      status.listenerRunning = listener.running;
+    } catch {
+      // ignore listener status failure and keep status from get_hook_install_status
+    }
+    hookStatus.value = status;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "读取 Hook 状态失败";
+    hookError.value = message;
+  }
+}
+
+async function handleInstallHooks() {
+  if (hookLoading.value) return;
+  hookLoading.value = true;
+  resetHookFeedback();
+
+  try {
+    if (!hookStatus.value) {
+      await refreshHookStatus();
+    }
+
+    const hooksExists = hookStatus.value?.hooksExists ?? false;
+    let overwriteHooks = false;
+
+    if (hooksExists) {
+      const confirmed = window.confirm(
+        "检测到 ~/.claude/settings.json 已有 hooks。确认后将覆盖整个 hooks 对象，并自动备份 settings.json。是否继续？",
+      );
+      if (!confirmed) {
+        hookMessage.value = "已取消覆盖，settings.json 未修改。";
+        return;
+      }
+      overwriteHooks = true;
+    }
+
+    const result = await installClaudeHooks(overwriteHooks);
+    hookWarnings.value = result.warnings ?? [];
+
+    const backupText = result.backupPath ? `备份文件：${result.backupPath}` : "未生成备份（之前无 hooks）。";
+    const overwriteText = result.overwrittenHooks ? "hooks 已覆盖。" : "hooks 已写入。";
+    const listenerText = result.listenerStarted ? "监听器已启动。" : "监听器未启动。";
+    hookMessage.value = `${overwriteText} ${backupText} ${listenerText}`;
+
+    await refreshHookStatus();
+  } catch (error) {
+    hookError.value = error instanceof Error ? error.message : "安装 Claude Hooks 失败";
+  } finally {
+    hookLoading.value = false;
+  }
+}
+
+async function handleRestartListener() {
+  if (listenerLoading.value) return;
+  listenerLoading.value = true;
+  resetHookFeedback();
+
+  try {
+    await stopListener().catch(() => null);
+    const status = await startListener();
+    hookMessage.value = status.running ? "监听已重启并运行中。" : "监听重启失败。";
+    await refreshHookStatus();
+  } catch (error) {
+    hookError.value = error instanceof Error ? error.message : "重启监听失败";
+  } finally {
+    listenerLoading.value = false;
+  }
+}
+
+async function handleStopListener() {
+  if (listenerLoading.value) return;
+  listenerLoading.value = true;
+  resetHookFeedback();
+
+  try {
+    const status = await stopListener();
+    hookMessage.value = status.running ? "监听停止失败。请重试。" : "监听已停止。";
+    await refreshHookStatus();
+  } catch (error) {
+    hookError.value = error instanceof Error ? error.message : "停止监听失败";
+  } finally {
+    listenerLoading.value = false;
+  }
+}
+
+onMounted(async () => {
+  await store.initialize();
+  await refreshHookStatus();
+});
 </script>
 
 <template>
@@ -107,11 +228,7 @@ const heroStatusHint = computed(() => {
         <SidebarMenu>
           <SidebarMenuItem>
             <SidebarMenuButton size="lg">
-              <img
-                :src="heroDeviceIcon"
-                alt="应用图标"
-                class="size-4 object-contain"
-              />
+              <img :src="heroDeviceIcon" alt="应用图标" class="size-4 object-contain" />
               <div class="grid flex-1 text-left text-sm leading-tight group-data-[collapsible=icon]:hidden">
                 <span class="truncate font-semibold">Claude Notify Bot</span>
                 <span class="truncate text-xs">Desktop Console</span>
@@ -147,7 +264,9 @@ const heroStatusHint = computed(() => {
         <div class="px-2 group-data-[collapsible=icon]:hidden">
           <Badge :variant="stateUi.variant" class="w-full justify-center">{{ stateUi.label }}</Badge>
         </div>
-        <div class="mx-2 mt-1 flex items-center justify-between rounded-md bg-sidebar-accent/60 px-2 py-2 group-data-[collapsible=icon]:hidden">
+        <div
+          class="mx-2 mt-1 flex items-center justify-between rounded-md bg-sidebar-accent/60 px-2 py-2 group-data-[collapsible=icon]:hidden"
+        >
           <span class="text-xs text-sidebar-foreground/80 group-data-[collapsible=icon]:hidden">自动重连</span>
           <UiSwitch :model-value="store.autoReconnect" @update:model-value="store.setAutoReconnect" />
         </div>
@@ -195,20 +314,86 @@ const heroStatusHint = computed(() => {
           </div>
         </section>
 
-        <section v-else-if="currentPage === 'mapping'" class="max-w-5xl">
-          <h2 class="text-3xl font-semibold tracking-tight">事件联动映射</h2>
-          <p class="mt-2 text-muted-foreground">在这里维护 Claude/Codex 事件到设备动作的映射。</p>
+        <section v-else-if="currentPage === 'mapping'" class="mx-auto w-full max-w-5xl space-y-8">
+          <div class="space-y-2">
+            <h2 class="text-3xl font-semibold tracking-tight">事件联动映射</h2>
+            <p class="text-muted-foreground">在这里维护 Claude/Codex 事件到设备动作的映射与 Hook 安装状态。</p>
+          </div>
 
-          <div class="mt-8 space-y-3">
-            <Card v-for="row in mappingRows" :key="row.event" class="p-5">
-              <div class="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
-                <div class="flex items-center gap-3">
-                  <Badge variant="outline">{{ row.event }}</Badge>
-                  <span class="text-sm">{{ row.action }}</span>
-                </div>
-                <span class="text-xs text-muted-foreground">{{ row.note }}</span>
+          <div class="rounded-2xl border border-border/70 bg-card/30 p-6 md:p-7">
+            <div class="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+              <div>
+                <h3 class="text-lg font-semibold">Hook 安装面板</h3>
+                <p class="mt-1 text-sm text-muted-foreground">
+                  一键生成脚本并写入 `~/.claude/settings.json`，安装后自动尝试拉起 listener。
+                </p>
               </div>
-            </Card>
+              <div class="flex flex-wrap items-center gap-2">
+                <Badge :variant="hookInstalled ? 'success' : 'outline'">
+                  {{ hookInstalled ? "Hooks 已安装" : "Hooks 未安装" }}
+                </Badge>
+                <Badge :variant="listenerRunning ? 'success' : 'secondary'">
+                  {{ listenerRunning ? "监听运行中" : "监听已停止" }}
+                </Badge>
+              </div>
+            </div>
+
+            <div class="mt-5 grid gap-3 rounded-lg border border-border/70 bg-background/40 p-4 text-xs md:grid-cols-2">
+              <div class="space-y-1">
+                <p class="text-muted-foreground">settings.json</p>
+                <p class="break-all font-mono">{{ settingsPathText }}</p>
+              </div>
+              <div class="space-y-1">
+                <p class="text-muted-foreground">脚本目录</p>
+                <p class="break-all font-mono">{{ scriptDirText }}</p>
+              </div>
+            </div>
+
+            <div class="mt-5 flex flex-wrap gap-3">
+              <Button :disabled="hookLoading || listenerLoading" @click="handleInstallHooks">
+                {{ hookLoading ? "安装中..." : "一键安装 Claude Hooks" }}
+              </Button>
+              <Button variant="secondary" :disabled="hookLoading || listenerLoading" @click="handleRestartListener">
+                {{ listenerLoading ? "处理中..." : "重启监听" }}
+              </Button>
+              <Button variant="outline" :disabled="hookLoading || listenerLoading" @click="handleStopListener">
+                停止监听
+              </Button>
+              <Button variant="ghost" :disabled="hookLoading || listenerLoading" @click="refreshHookStatus">
+                刷新状态
+              </Button>
+            </div>
+
+            <p v-if="hookMessage" class="mt-4 text-sm text-foreground/90">{{ hookMessage }}</p>
+            <p v-if="hookError" class="mt-2 text-sm text-destructive">{{ hookError }}</p>
+
+            <div v-if="hookWarnings.length > 0" class="mt-3 rounded-lg border border-amber-500/40 bg-amber-500/10 p-3">
+              <p class="text-sm font-medium text-amber-300">Warnings</p>
+              <p v-for="warning in hookWarnings" :key="warning" class="mt-1 text-xs text-amber-200/90">
+                - {{ warning }}
+              </p>
+            </div>
+          </div>
+
+          <div class="overflow-hidden rounded-2xl border border-border/70 bg-background/35">
+            <table class="w-full text-sm">
+              <thead class="border-b border-border/70 bg-muted/35 text-left text-muted-foreground">
+                <tr>
+                  <th class="px-4 py-3 font-medium">事件</th>
+                  <th class="px-4 py-3 font-medium">设备动作</th>
+                  <th class="px-4 py-3 font-medium">说明</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="row in mappingRows" :key="row.event" class="border-b border-border/60 last:border-none">
+                  <td class="px-4 py-3">
+                    <Badge variant="outline">{{ row.event }}</Badge>
+                  </td>
+                  <td class="px-4 py-3">{{ row.action }}</td>
+                  <td class="px-4 py-3 text-muted-foreground">{{ row.note }}</td>
+                </tr>
+              </tbody>
+            </table>
           </div>
         </section>
 
