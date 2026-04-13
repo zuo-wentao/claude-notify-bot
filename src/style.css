@@ -1,0 +1,71 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --background: 224 24% 9%;
+  --foreground: 210 40% 96%;
+  --card: 224 22% 12%;
+  --card-foreground: 210 40% 96%;
+  --primary: 24 95% 53%;
+  --primary-foreground: 26 83% 9%;
+  --secondary: 223 17% 17%;
+  --secondary-foreground: 210 40% 96%;
+  --muted: 223 17% 17%;
+  --muted-foreground: 215 20% 70%;
+  --accent: 24 95% 53%;
+  --accent-foreground: 26 83% 9%;
+  --destructive: 0 84.2% 60.2%;
+  --destructive-foreground: 0 0% 98%;
+  --border: 224 16% 22%;
+  --input: 224 16% 22%;
+  --ring: 24 95% 53%;
+  --radius: 0.75rem;
+}
+
+* {
+  @apply border-border;
+}
+
+body {
+  @apply bg-background text-foreground antialiased;
+  margin: 0;
+  min-height: 100vh;
+  font-family: "Inter", "PingFang SC", "Microsoft YaHei", system-ui, -apple-system, sans-serif;
+}
+
+
+
+@layer base {
+  :root {
+    --sidebar-background: 224 27% 11%;
+    --sidebar-foreground: 210 35% 94%;
+    --sidebar-primary: 24 95% 53%;
+    --sidebar-primary-foreground: 26 83% 9%;
+    --sidebar-accent: 223 18% 18%;
+    --sidebar-accent-foreground: 210 35% 94%;
+    --sidebar-border: 224 16% 22%;
+    --sidebar-ring: 24 95% 53%;
+  }
+  .dark {
+    --sidebar-background: 240 5.9% 10%;
+    --sidebar-foreground: 240 4.8% 95.9%;
+    --sidebar-primary: 224.3 76.3% 48%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 240 3.7% 15.9%;
+    --sidebar-accent-foreground: 240 4.8% 95.9%;
+    --sidebar-border: 240 3.7% 15.9%;
+    --sidebar-ring: 217.2 91.2% 59.8%;
+  }
+}
+
+
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+}
