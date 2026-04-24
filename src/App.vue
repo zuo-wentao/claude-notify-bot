@@ -37,6 +37,8 @@ import {
   stopListener,
 } from "@/services/hook-installer-api";
 import type { HookInstallStatus, HookTip } from "@/types/hooks";
+import { valveQueryStatus, valveSetLed, valveStart, valveStop } from "@/services/valve-protocol-api";
+import type { ValveStatus } from "@/types/valve";
 
 type PageKey = "home" | "mapping" | "about";
 
@@ -70,6 +72,24 @@ const deviceKeyword = ref("");
 const selectedDeviceId = ref<string | null>(null);
 const pickerLoading = ref(false);
 const homeHookTips = ref<HookTip[]>([]);
+const valveLoading = ref(false);
+const valveMessage = ref("");
+const valveError = ref("");
+const valveStatus = ref<ValveStatus | null>(null);
+const startPush = ref("100");
+const startRelease = ref("100");
+const startCount = ref("2");
+const startInterval = ref("200");
+const startDuty = ref("100");
+const ledMode = ref("2");
+const ledR = ref("255");
+const ledG = ref("85");
+const ledB = ref("0");
+const ledSpeed = ref("2000");
+const autoPulseEnabled = ref(true);
+const autoPulseBusy = ref(false);
+const autoPulseLastEvent = ref("");
+const latestHookTipKey = ref<string | null>(null);
 let hookTipTimer: ReturnType<typeof setInterval> | null = null;
 
 const stateUi = computed(() => {
@@ -107,17 +127,21 @@ const hookInstalled = computed(() => {
   return hookStatus.value.hooksExists && hookStatus.value.scriptFilesReady;
 });
 
-const connectableDevices = computed(() => store.devices.filter((device) => device.connectable));
-const filteredConnectableDevices = computed(() => {
+const scannedDevices = computed(() => store.devices);
+const filteredDevices = computed(() => {
   const keyword = deviceKeyword.value.trim().toLowerCase();
-  if (!keyword) return connectableDevices.value;
+  if (!keyword) return scannedDevices.value;
 
-  return connectableDevices.value.filter((device) => {
+  return scannedDevices.value.filter((device) => {
     const name = device.name.toLowerCase();
     const id = device.id.toLowerCase();
     return name.includes(keyword) || id.includes(keyword);
   });
 });
+const selectedDevice = computed(() => {
+  return scannedDevices.value.find((device) => device.id === selectedDeviceId.value) ?? null;
+});
+const selectedDeviceConnectable = computed(() => selectedDevice.value?.connectable === true);
 const homeDeviceButtonText = computed(() => {
   if (store.loadingConnect) return "处理中...";
   if (store.connectionState === "connected") return "断开设备";
@@ -143,9 +167,9 @@ function resetHookFeedback() {
 
 function normalizeSelectedDevice() {
   const current = selectedDeviceId.value;
-  const inFiltered = filteredConnectableDevices.value.some((device) => device.id === current);
+  const inFiltered = filteredDevices.value.some((device) => device.id === current);
   if (inFiltered) return;
-  selectedDeviceId.value = filteredConnectableDevices.value[0]?.id ?? null;
+  selectedDeviceId.value = filteredDevices.value[0]?.id ?? null;
 }
 
 function formatTipTime(value: string): string {
@@ -156,7 +180,24 @@ function formatTipTime(value: string): string {
 
 async function refreshHookTips() {
   try {
-    homeHookTips.value = await getRecentHookTips(5);
+    const tips = await getRecentHookTips(5);
+    homeHookTips.value = tips;
+
+    const latestTip = tips[0];
+    if (!latestTip) return;
+
+    const latestKey = `${latestTip.time}|${latestTip.event}|${latestTip.detail}`;
+    if (latestHookTipKey.value === null) {
+      latestHookTipKey.value = latestKey;
+      return;
+    }
+
+    if (latestHookTipKey.value === latestKey) {
+      return;
+    }
+
+    latestHookTipKey.value = latestKey;
+    void triggerAutoPulseFromHookTip(latestTip);
   } catch {
     // ignore tips pull errors to avoid disturbing normal operations
   }
@@ -173,12 +214,14 @@ async function handleOpenHookLogFolder() {
 
 async function refreshDevicePicker() {
   pickerLoading.value = true;
-  homeDeviceHint.value = "正在扫描可连接设备...";
+  homeDeviceHint.value = "正在持续扫描蓝牙设备...";
 
   try {
-    await store.refreshDevices();
+    await store.restartRealtimeScan();
     normalizeSelectedDevice();
-    homeDeviceHint.value = connectableDevices.value.length > 0 ? "请选择设备并连接" : "未发现可连接设备";
+    homeDeviceHint.value = scannedDevices.value.length > 0 ? "请选择设备并连接" : "扫描中，暂未发现设备";
+  } catch (error) {
+    homeDeviceHint.value = error instanceof Error ? error.message : "蓝牙扫描启动失败";
   } finally {
     pickerLoading.value = false;
   }
@@ -187,18 +230,15 @@ async function refreshDevicePicker() {
 function openDevicePicker() {
   showDevicePicker.value = true;
   deviceKeyword.value = "";
+  homeDeviceHint.value = "正在持续扫描蓝牙设备...";
   normalizeSelectedDevice();
-
-  if (connectableDevices.value.length === 0) {
-    void refreshDevicePicker();
-  } else {
-    homeDeviceHint.value = "请选择设备并连接";
-  }
+  void refreshDevicePicker();
 }
 
 function closeDevicePicker() {
   showDevicePicker.value = false;
   deviceKeyword.value = "";
+  void store.stopRealtimeScan();
 }
 
 function handleDevicePickerOpenChange(open: boolean) {
@@ -211,7 +251,7 @@ function handleDevicePickerOpenChange(open: boolean) {
 
 async function connectSelectedDevice() {
   normalizeSelectedDevice();
-  const target = store.devices.find((device) => device.id === selectedDeviceId.value && device.connectable) ?? null;
+  const target = store.devices.find((device) => device.id === selectedDeviceId.value && device.connectable === true) ?? null;
 
   if (!target) {
     homeDeviceHint.value = "请先选择一个可连接设备";
@@ -303,6 +343,125 @@ function cancelOverwriteInstall() {
   hookMessage.value = "已取消覆盖，settings.json 未修改。";
 }
 
+function resetValveFeedback() {
+  valveError.value = "";
+  valveMessage.value = "";
+}
+
+function setAutoPulseEnabled(value: boolean) {
+  autoPulseEnabled.value = value;
+}
+
+function shouldIgnoreAutoPulseEvent(eventName: string): boolean {
+  const normalized = eventName.trim().toLowerCase();
+  return normalized === "userpromptsubmit";
+}
+
+function parseIntField(value: string, label: string): number {
+  const parsed = Number.parseInt(value, 10);
+  if (Number.isNaN(parsed)) {
+    throw new Error(`${label} 必须是整数`);
+  }
+  return parsed;
+}
+
+async function handleValveStart() {
+  if (valveLoading.value) return;
+  valveLoading.value = true;
+  resetValveFeedback();
+
+  try {
+    await valveStart({
+      push: parseIntField(startPush.value, "push"),
+      release: parseIntField(startRelease.value, "release"),
+      count: parseIntField(startCount.value, "count"),
+      interval: parseIntField(startInterval.value, "interval"),
+      duty: parseIntField(startDuty.value, "duty"),
+    });
+    valveMessage.value = "START 命令已发送";
+  } catch (error) {
+    valveError.value = error instanceof Error ? error.message : "发送 START 失败";
+  } finally {
+    valveLoading.value = false;
+  }
+}
+
+async function handleValveStop() {
+  if (valveLoading.value) return;
+  valveLoading.value = true;
+  resetValveFeedback();
+
+  try {
+    await valveStop();
+    valveMessage.value = "STOP 命令已发送";
+  } catch (error) {
+    valveError.value = error instanceof Error ? error.message : "发送 STOP 失败";
+  } finally {
+    valveLoading.value = false;
+  }
+}
+
+async function handleValveLed() {
+  if (valveLoading.value) return;
+  valveLoading.value = true;
+  resetValveFeedback();
+
+  try {
+    await valveSetLed({
+      mode: parseIntField(ledMode.value, "mode") as 0 | 1 | 2,
+      r: parseIntField(ledR.value, "r"),
+      g: parseIntField(ledG.value, "g"),
+      b: parseIntField(ledB.value, "b"),
+      speed: parseIntField(ledSpeed.value, "speed"),
+    });
+    valveMessage.value = "LED 命令已发送";
+  } catch (error) {
+    valveError.value = error instanceof Error ? error.message : "发送 LED 失败";
+  } finally {
+    valveLoading.value = false;
+  }
+}
+
+async function handleValveQuery() {
+  if (valveLoading.value) return;
+  valveLoading.value = true;
+  resetValveFeedback();
+
+  try {
+    valveStatus.value = await valveQueryStatus();
+    valveMessage.value = "QUERY 成功";
+  } catch (error) {
+    valveError.value = error instanceof Error ? error.message : "发送 QUERY 失败";
+  } finally {
+    valveLoading.value = false;
+  }
+}
+
+async function triggerAutoPulseFromHookTip(tip: HookTip) {
+  if (!autoPulseEnabled.value || autoPulseBusy.value) return;
+  if (store.connectionState !== "connected") return;
+  if (valveLoading.value) return;
+  if (shouldIgnoreAutoPulseEvent(tip.event)) return;
+
+  autoPulseBusy.value = true;
+  try {
+    await valveStart({
+      push: parseIntField(startPush.value, "push"),
+      release: parseIntField(startRelease.value, "release"),
+      count: parseIntField(startCount.value, "count"),
+      interval: parseIntField(startInterval.value, "interval"),
+      duty: parseIntField(startDuty.value, "duty"),
+    });
+    autoPulseLastEvent.value = `${tip.event} @ ${formatTipTime(tip.time)}`;
+    valveMessage.value = `自动触发成功：${tip.event} -> START ${startPush.value} ${startRelease.value} ${startCount.value} ${startInterval.value} ${startDuty.value}`;
+    valveError.value = "";
+  } catch (error) {
+    valveError.value = error instanceof Error ? error.message : "自动触发 START 失败";
+  } finally {
+    autoPulseBusy.value = false;
+  }
+}
+
 async function handleRestartListener() {
   if (listenerLoading.value) return;
   listenerLoading.value = true;
@@ -346,6 +505,7 @@ onMounted(async () => {
 });
 
 onUnmounted(() => {
+  void store.stopRealtimeScan();
   if (hookTipTimer) {
     clearInterval(hookTipTimer);
     hookTipTimer = null;
@@ -548,6 +708,76 @@ onUnmounted(() => {
               </tbody>
             </table>
           </div>
+
+          <Card class="p-6">
+            <h3 class="text-lg font-semibold">阀门推杆协议调试</h3>
+            <p class="mt-1 text-sm text-muted-foreground">
+              已对接 `START/STOP/LED/QUERY` 文本协议，命令会通过当前蓝牙连接下发。
+            </p>
+            <div class="mt-3 flex items-center justify-between rounded-lg border border-border/70 bg-background/35 px-3 py-2">
+              <div>
+                <p class="text-sm font-medium">Claude 事件自动推两下</p>
+                <p class="text-xs text-muted-foreground">
+                  参数：START {{ startPush }} {{ startRelease }} {{ startCount }} {{ startInterval }} {{ startDuty }}
+                </p>
+                <p v-if="autoPulseLastEvent" class="text-xs text-muted-foreground">最近触发：{{ autoPulseLastEvent }}</p>
+              </div>
+              <UiSwitch :model-value="autoPulseEnabled" @update:model-value="setAutoPulseEnabled" />
+            </div>
+
+            <div class="mt-4 grid gap-3 md:grid-cols-5">
+              <Input v-model="startPush" placeholder="push(ms)" />
+              <Input v-model="startRelease" placeholder="release(ms)" />
+              <Input v-model="startCount" placeholder="count" />
+              <Input v-model="startInterval" placeholder="interval(ms)" />
+              <Input v-model="startDuty" placeholder="duty(%)" />
+            </div>
+            <div class="mt-3 flex flex-wrap gap-2">
+              <Button :disabled="valveLoading || store.connectionState !== 'connected'" @click="handleValveStart">
+                {{ valveLoading ? "发送中..." : "发送 START" }}
+              </Button>
+              <Button
+                variant="outline"
+                :disabled="valveLoading || store.connectionState !== 'connected'"
+                @click="handleValveStop"
+              >
+                发送 STOP
+              </Button>
+            </div>
+
+            <div class="mt-5 grid gap-3 md:grid-cols-5">
+              <Input v-model="ledMode" placeholder="mode(0~2)" />
+              <Input v-model="ledR" placeholder="r(0~255)" />
+              <Input v-model="ledG" placeholder="g(0~255)" />
+              <Input v-model="ledB" placeholder="b(0~255)" />
+              <Input v-model="ledSpeed" placeholder="speed(ms)" />
+            </div>
+            <div class="mt-3 flex flex-wrap gap-2">
+              <Button
+                variant="secondary"
+                :disabled="valveLoading || store.connectionState !== 'connected'"
+                @click="handleValveLed"
+              >
+                发送 LED
+              </Button>
+              <Button
+                variant="ghost"
+                :disabled="valveLoading || store.connectionState !== 'connected'"
+                @click="handleValveQuery"
+              >
+                发送 QUERY
+              </Button>
+            </div>
+
+            <p v-if="valveMessage" class="mt-4 text-sm text-foreground/90">{{ valveMessage }}</p>
+            <p v-if="valveError" class="mt-2 text-sm text-destructive">{{ valveError }}</p>
+            <div v-if="valveStatus" class="mt-4 rounded-lg border border-border/70 bg-background/35 p-3 text-sm">
+              <p>running: {{ valveStatus.running ? 1 : 0 }}</p>
+              <p>count: {{ valveStatus.count }}</p>
+              <p>state: {{ valveStatus.state }} ({{ valveStatus.stateLabel }})</p>
+              <p class="mt-1 text-xs text-muted-foreground">raw: {{ valveStatus.raw }}</p>
+            </div>
+          </Card>
         </section>
 
         <section v-else class="max-w-4xl">
@@ -571,7 +801,7 @@ onUnmounted(() => {
             <div class="p-5">
               <SheetHeader>
                 <SheetTitle>选择蓝牙设备</SheetTitle>
-                <SheetDescription>先搜索设备，选中后点击连接。</SheetDescription>
+                <SheetDescription>打开面板后会持续扫描，选中可连接设备后点击连接。</SheetDescription>
               </SheetHeader>
 
               <div class="mt-4 flex items-center gap-2">
@@ -587,7 +817,7 @@ onUnmounted(() => {
 
               <div class="mt-4 max-h-64 space-y-2 overflow-auto pr-1">
                 <button
-                  v-for="device in filteredConnectableDevices"
+                  v-for="device in filteredDevices"
                   :key="device.id"
                   type="button"
                   class="flex w-full items-center justify-between rounded-md border px-3 py-2 text-left text-sm transition-colors"
@@ -598,11 +828,19 @@ onUnmounted(() => {
                   "
                   @click="selectedDeviceId = device.id"
                 >
-                  <span class="truncate">{{ device.name }}</span>
-                  <span class="ml-2 shrink-0 text-xs opacity-80">RSSI {{ device.rssi ?? "-" }}</span>
+                  <span class="min-w-0">
+                    <span class="block truncate">{{ device.name }}</span>
+                    <span class="block truncate text-[11px] opacity-70">{{ device.id }}</span>
+                  </span>
+                  <span class="ml-2 flex shrink-0 items-center gap-2 text-xs">
+                    <Badge :variant="device.connectable === true ? 'success' : device.connectable === false ? 'outline' : 'secondary'">
+                      {{ device.connectable === true ? "可连接" : device.connectable === false ? "不可连接" : "连接能力未知" }}
+                    </Badge>
+                    <span class="opacity-80">RSSI {{ device.rssi ?? "-" }}</span>
+                  </span>
                 </button>
-                <p v-if="filteredConnectableDevices.length === 0" class="py-8 text-center text-sm text-muted-foreground">
-                  暂无可连接设备
+                <p v-if="filteredDevices.length === 0" class="py-8 text-center text-sm text-muted-foreground">
+                  {{ store.loadingScan ? "扫描中，暂未发现设备" : "暂无扫描设备" }}
                 </p>
               </div>
 
@@ -610,10 +848,10 @@ onUnmounted(() => {
                 <Button size="sm" variant="ghost" @click="closeDevicePicker">取消</Button>
                 <Button
                   size="sm"
-                  :disabled="!selectedDeviceId || store.loadingConnect"
+                  :disabled="!selectedDeviceConnectable || store.loadingConnect"
                   @click="connectSelectedDevice"
                 >
-                  {{ store.loadingConnect ? "连接中..." : "连接选中设备" }}
+                  {{ store.loadingConnect ? "连接中..." : selectedDeviceConnectable ? "连接选中设备" : "设备不可连接" }}
                 </Button>
               </SheetFooter>
             </div>

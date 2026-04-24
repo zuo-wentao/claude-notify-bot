@@ -1,13 +1,23 @@
 import { computed, ref } from "vue";
 import { defineStore } from "pinia";
-import type { BluetoothSettings, ConnectionState, DeviceSummary } from "@/types/bluetooth";
+import type {
+  BluetoothSettings,
+  ConnectionState,
+  DeviceSummary,
+  ScanState,
+  ScanStatePayload,
+} from "@/types/bluetooth";
 import {
   connectDevice,
   disconnectDevice,
   getConnectionState,
+  getScannedDevices,
+  listenBluetoothScanEvents,
   loadBluetoothSettings,
   saveBluetoothSettings,
   scanDevices,
+  startDeviceScan,
+  stopDeviceScan,
 } from "@/services/bluetooth-api";
 
 function nowLabel() {
@@ -16,6 +26,7 @@ function nowLabel() {
 
 export const useBluetoothStore = defineStore("bluetooth", () => {
   const connectionState = ref<ConnectionState>("disconnected");
+  const scanState = ref<ScanState>("idle");
   const devices = ref<DeviceSummary[]>([]);
   const connectedDevice = ref<DeviceSummary | null>(null);
   const autoReconnect = ref<boolean>(true);
@@ -24,6 +35,8 @@ export const useBluetoothStore = defineStore("bluetooth", () => {
   const loadingConnect = ref(false);
   const errorMessage = ref<string | null>(null);
   const logs = ref<string[]>([]);
+
+  let realtimeUnlisten: (() => Promise<void>) | null = null;
 
   const canDisconnect = computed(() => connectionState.value === "connected");
 
@@ -39,28 +52,58 @@ export const useBluetoothStore = defineStore("bluetooth", () => {
     await saveBluetoothSettings(settings);
   }
 
+  function normalizeConnectionStateFromScan() {
+    if (connectionState.value === "connected" || connectionState.value === "connecting") {
+      return;
+    }
+
+    connectionState.value = scanState.value === "scanning" ? "scanning" : "disconnected";
+  }
+
+  function applyDeviceSnapshot(snapshot: DeviceSummary[]) {
+    devices.value = snapshot;
+
+    if (connectedDevice.value) {
+      const latest = snapshot.find((item) => item.id === connectedDevice.value?.id);
+      if (latest) {
+        connectedDevice.value = latest;
+      }
+    }
+  }
+
+  function handleScanState(payload: ScanStatePayload) {
+    scanState.value = payload.state;
+
+    if (payload.state === "error") {
+      const message = payload.message ?? "蓝牙扫描失败";
+      errorMessage.value = message;
+      connectionState.value = "error";
+      appendLog(`扫描失败：${message}`);
+      setTimeout(() => {
+        if (connectionState.value === "error") {
+          normalizeConnectionStateFromScan();
+        }
+      }, 600);
+      return;
+    }
+
+    errorMessage.value = null;
+    normalizeConnectionStateFromScan();
+  }
+
   async function refreshDevices() {
     loadingScan.value = true;
     errorMessage.value = null;
-    connectionState.value = connectedDevice.value ? "connected" : "scanning";
+
+    if (connectionState.value !== "connected" && connectionState.value !== "connecting") {
+      connectionState.value = "scanning";
+    }
 
     try {
       const result = await scanDevices();
-      devices.value = result;
-      appendLog(`扫描到 ${result.length} 个设备`);
-
-      if (connectedDevice.value) {
-        const latestConnected = result.find((item) => item.id === connectedDevice.value?.id);
-        if (latestConnected) {
-          connectedDevice.value = latestConnected;
-        }
-      }
-
-      const state = await getConnectionState();
-      connectionState.value = state;
-      if (state !== "connected" && !connectedDevice.value) {
-        connectionState.value = "disconnected";
-      }
+      applyDeviceSnapshot(result);
+      appendLog(`设备快照更新：${result.length} 个`);
+      normalizeConnectionStateFromScan();
     } catch (error) {
       const message = error instanceof Error ? error.message : "扫描设备失败";
       errorMessage.value = message;
@@ -71,7 +114,83 @@ export const useBluetoothStore = defineStore("bluetooth", () => {
     }
   }
 
+  async function startRealtimeScan() {
+    if (realtimeUnlisten) return;
+
+    loadingScan.value = true;
+    errorMessage.value = null;
+
+    try {
+      realtimeUnlisten = await listenBluetoothScanEvents({
+        onDevicesUpdated: (snapshot) => {
+          applyDeviceSnapshot(snapshot);
+        },
+        onScanState: (payload) => {
+          handleScanState(payload);
+        },
+      });
+
+      await startDeviceScan();
+      scanState.value = "scanning";
+      const snapshot = await getScannedDevices();
+      applyDeviceSnapshot(snapshot);
+      normalizeConnectionStateFromScan();
+      appendLog("已开始持续扫描蓝牙设备");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "启动蓝牙扫描失败";
+      errorMessage.value = message;
+      scanState.value = "error";
+      connectionState.value = "error";
+
+      if (realtimeUnlisten) {
+        await realtimeUnlisten().catch(() => undefined);
+        realtimeUnlisten = null;
+      }
+
+      appendLog(`扫描启动失败：${message}`);
+      throw error;
+    } finally {
+      loadingScan.value = false;
+    }
+  }
+
+  async function stopRealtimeScan() {
+    const hadActiveScan = !!realtimeUnlisten || scanState.value === "scanning";
+    const unlisten = realtimeUnlisten;
+    realtimeUnlisten = null;
+
+    try {
+      await stopDeviceScan();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "停止蓝牙扫描失败";
+      errorMessage.value = message;
+      appendLog(`停止扫描失败：${message}`);
+    }
+
+    if (unlisten) {
+      await unlisten().catch(() => undefined);
+    }
+
+    scanState.value = "idle";
+    normalizeConnectionStateFromScan();
+    if (hadActiveScan) {
+      appendLog("已停止蓝牙扫描");
+    }
+  }
+
+  async function restartRealtimeScan() {
+    await stopRealtimeScan();
+    await startRealtimeScan();
+  }
+
   async function connectToDevice(device: DeviceSummary) {
+    if (device.connectable !== true) {
+      const message = "该设备当前不可连接";
+      errorMessage.value = message;
+      appendLog(`连接失败：${message}`);
+      return;
+    }
+
     loadingConnect.value = true;
     errorMessage.value = null;
     connectionState.value = "connecting";
@@ -92,7 +211,7 @@ export const useBluetoothStore = defineStore("bluetooth", () => {
       loadingConnect.value = false;
       if (connectionState.value === "error") {
         setTimeout(() => {
-          if (connectionState.value === "error") connectionState.value = "disconnected";
+          if (connectionState.value === "error") normalizeConnectionStateFromScan();
         }, 600);
       }
     }
@@ -101,11 +220,12 @@ export const useBluetoothStore = defineStore("bluetooth", () => {
   async function disconnectCurrentDevice() {
     errorMessage.value = null;
     try {
-      connectionState.value = await disconnectDevice();
+      await disconnectDevice();
       if (connectedDevice.value) {
         appendLog(`已断开：${connectedDevice.value.name}`);
       }
       connectedDevice.value = null;
+      normalizeConnectionStateFromScan();
     } catch (error) {
       const message = error instanceof Error ? error.message : "断开失败";
       errorMessage.value = message;
@@ -135,10 +255,15 @@ export const useBluetoothStore = defineStore("bluetooth", () => {
       connectionState.value = "disconnected";
     }
 
-    await refreshDevices();
+    try {
+      const snapshot = await getScannedDevices();
+      applyDeviceSnapshot(snapshot);
+    } catch {
+      // ignore initial scan cache read errors
+    }
 
     if (autoReconnect.value && lastDeviceId.value) {
-      const target = devices.value.find((item) => item.id === lastDeviceId.value && item.connectable);
+      const target = devices.value.find((item) => item.id === lastDeviceId.value && item.connectable === true);
       if (target) {
         appendLog(`尝试自动重连：${target.name}`);
         await connectToDevice(target);
@@ -150,6 +275,7 @@ export const useBluetoothStore = defineStore("bluetooth", () => {
 
   return {
     connectionState,
+    scanState,
     devices,
     connectedDevice,
     autoReconnect,
@@ -161,6 +287,9 @@ export const useBluetoothStore = defineStore("bluetooth", () => {
     canDisconnect,
     initialize,
     refreshDevices,
+    startRealtimeScan,
+    stopRealtimeScan,
+    restartRealtimeScan,
     connectToDevice,
     disconnectCurrentDevice,
     setAutoReconnect,
